@@ -1,0 +1,1189 @@
+\documentclass[12pt]{article}\usepackage{graphicx, color}
+%% maxwidth is the original width if it is less than linewidth
+%% otherwise use linewidth (to make sure the graphics do not exceed the margin)
+
+\usepackage{alltt}
+\usepackage{geometry}                % See geometry.pdf to learn the layout options. There are lots.
+\geometry{letterpaper}                   % ... or a4paper or a5paper or ... 
+%\geometry{landscape}                % Activate for for rotated page geometry
+%\usepackage[parfill]{parskip}    % Activate to begin paragraphs with an empty line rather than an indent
+\usepackage{graphicx}
+\usepackage{amssymb}
+\usepackage{epstopdf}
+\usepackage{indentfirst}
+%\usepackage{genres}
+\newcommand{\citep}{\cite}
+\usepackage{titlesec}
+\usepackage{color}
+\DeclareGraphicsRule{.tif}{png}{.png}{`convert #1 `dirname #1`/`basename #1 .tif`.png}
+
+\renewcommand{\textcolor}[2]{#2}
+
+% section headings
+\titleformat{\section}[block]{\color{black}\Large\bfseries\filcenter}{}{1em}{}
+
+\setlength\parindent{24pt}
+
+\title{Design and analysis of Bar-seq experiments}
+\author{David G. Robinson$^{1}$, Wei Chen$^{2}$, John D. Storey$^{1,4}$ and David Gresham$^{3,4}$}
+
+\Sexpr{opts_chunk$set(echo=FALSE, message=FALSE, cache=TRUE, cache.path="cache_knitr/", warning=FALSE)}    % Remove this line to make R code appear in final document
+
+\date{}
+
+\begin{document}
+\maketitle
+
+<<barseq_library, results="hide", cache=FALSE>>=
+library(methods)
+library(plyr)
+
+setClass("barcode.counts",
+    representation(
+        counts = "matrix",
+        design = "data.frame",
+        comparisons = "list",
+        pvalue = "data.frame",
+        qvalue = "data.frame",
+        logFC = "data.frame",
+        conditions = "character"
+    )
+)
+
+setMethod("initialize", "barcode.counts",
+    function(.Object, counts, design) {
+        .Object@counts = counts
+
+        if (NROW(design) != NCOL(counts)) {
+            stop("Design must have as many rows as there are count columns")
+        }
+
+        # check for legal replicate names
+        legal = c("tag", "biological", "technical", "condition", "time")
+        for (n in colnames(design)) {
+            if (!(n %in% legal)) {
+                stop(paste(c("Illegal column name in design matrix",
+                             "legal names are", legal), collapse=", "))
+            }
+        }
+        
+        .Object@design = design
+        .Object@conditions = ""
+        .Object@comparisons = list()
+        .Object@pvalue = data.frame()
+
+        .Object
+    }
+)
+
+### combine.counts ###
+## the combine.counts methods adds up and down tags for each sample, which
+## is recommended before performing any analysis
+
+setGeneric("combine.counts",
+            function(.Object, ...) standardGeneric("combine.counts"))
+
+setMethod("combine.counts", "barcode.counts",
+    function(.Object, combine.by="tag") {
+        if (length(.Object@comparisons) > 0) {
+            stop(paste("Don't perform combining after differential abundance",
+                       "comparisons have already been made"))
+        }
+
+        new.design = .Object@design[!(names(.Object@design) %in% combine.by)]
+        interacter = do.call(interaction, c(new.design, list(drop=TRUE)))
+
+        # sum each group
+        .Object@counts = t(apply(.Object@counts, 1, function(row) {
+            tapply(row, interacter, sum) 
+        }))
+    
+        .Object@design = as.data.frame(apply(new.design, 2, function(x) tapply(x, interacter, function(x) x[1])))
+        .Object
+    })
+
+
+add.data.frame = function(d, name, col) {
+    # add a column to a data frame if the data frame isn't empty, otherwise
+    # recreate it and add it as the first column
+    if (NROW(d) == 0) {
+        d = data.frame(a=col)
+        colnames(d) = name
+    }
+    else {
+        d[[name]] = col
+    }
+    d
+}
+
+setGeneric("differential.abundance",
+            function(.Object, ...) standardGeneric("differential.abundance"))
+
+setMethod("differential.abundance", "barcode.counts",
+    function(.Object, method, condition1, condition2, ...) {
+        if (length(.Object@conditions) == 2 &&
+            (!all(c(condition1, condition2) == .Object@conditions))) {
+            stop(paste("Already performed comparison between conditions",
+                        .Object@conditions[1], "and", .Object@conditions[2]))
+        }
+        for (cond in list(condition1, condition2)) {
+            if (!(cond %in% .Object@design$condition)) {
+                stop(paste("Condition", cond, "not found in design matrix"))
+            }
+        }
+        library(qvalue)
+        treatment = .Object@design$condition
+        if (method == "DESeq") {
+            # perform a negative binomial test using the DESeq package
+            require(DESeq)
+            cds = newCountDataSet(.Object@counts, treatment)
+	        cds = estimateSizeFactors(cds)
+	        cds = estimateDispersions(cds, fitType="local", ...)
+	        result = nbinomTest(cds, condition1, condition2)
+	        .Object@pvalue = add.data.frame(.Object@pvalue, method,
+	                                        result$pval)
+	        .Object@qvalue = add.data.frame(.Object@qvalue, method,
+	                                            qvalue(result$pval)$qvalue)
+	        .Object@logFC = add.data.frame(.Object@logFC, method,
+	                                            log2(result$foldChange))
+        } else if (method == "edgeR") {
+            require(edgeR)
+            d = DGEList(counts=.Object@counts, group=treatment)
+            d = estimateCommonDisp(d)
+            d = estimateTagwiseDisp(d)
+            result = exactTest(d, pair=c(condition1, condition2))
+	        .Object@pvalue = add.data.frame(.Object@pvalue, method,
+	                                        result$table$PValue)
+	        .Object@qvalue = add.data.frame(.Object@qvalue, method,
+	                                        qvalue(result$table$PValue)$qvalue)
+	        .Object@logFC = add.data.frame(.Object@logFC, method,
+	                                            result$table$logFC)
+        } else if (method == "baySeq") {
+            require(baySeq)
+            groups = list(NDE=rep(1, length(treatment),
+                          DE=treatment))
+            CD = new("countData", data=.Object@counts,
+                        replicates=treatment, groups=groups)
+            CD@libsizes = getLibsizes(CD)
+            CD@annotation = data.frame(name=rownames(.Object@counts))
+            CD = getPriors.NB(CD, samplesize = 1000, estimation = "QL",
+                                cl=NULL)
+            result = getLikelihoods.NB(CD, pET='BIC', cl=NULL)
+        } else {
+            stop(paste("Only methods for differential abundance are DESeq,",
+                       "edgeR and baySeq"))
+        }
+        .Object@comparisons[[method]] = result
+        .Object@conditions = c(condition1, condition2)
+        .Object
+    }
+)
+
+
+setGeneric("filter.counts",
+            function(.Object, ...) standardGeneric("filter.counts"))
+
+setMethod("filter.counts", "barcode.counts",
+    function(.Object, min.reads=NULL, max.reads=NULL) {
+        if (length(.Object@comparisons) > 0) {
+            stop(paste("Don't perform filtering after differential abundance",
+                       "comparisons have already been made"))
+        }
+    
+        # for now, we'll keep it simple
+        if (!is.null(min.reads)) {
+            .Object@counts = .Object@counts[rowSums(.Object@counts)
+                                                    >= min.reads, ]
+        }
+    
+        if (!is.null(max.reads)) {
+            .Object@counts = .Object@counts[rowSums(.Object@counts)
+                                                    <= max.reads, ]
+        }
+        .Object
+    }
+)
+
+setMethod("[", c("barcode.counts"),
+    function(x, i, j, ..., drop=TRUE) {
+    x@counts = x@counts[, i]
+    x@design = x@design[i, ]
+    if (drop == TRUE) {
+        x@design = droplevels(x@design)
+    }
+    x
+})
+@
+
+\noindent $^{1}$Lewis-Sigler Institute for Integrative Genomics, Princeton University, Princeton. $^{2}$Berlin Institute for Medical Systems Biology, Max-Delbr\"{u}ck-Center for Molecular Medicine, 13125 Berlin, Germany. $^{3}$Center for Genomics and Systems Biology, Department of Biology, New York University, New York.
+\\
+\\
+$^{4}$correspondence: dgresham@nyu.edu and jstorey@princeton.edu 
+\\
+\\
+\newpage
+\noindent Running title: High-throughput genetic screens
+\\
+\\
+Key words \\
+ - yeast \\
+ - Bar-Seq \\
+ - galactose \\
+ - functional genomics \\
+ - Sacchromyces cerevisiae \\
+\\
+\\
+\\
+David Gresham \\
+12 Waverly Place, Rm 203 \\
+New York Univeristy \\
+New York NY 10003 \\
+USA \\
+Ph: 212-998-3879 \\
+E-mail: dgresham@nyu.edu
+\\
+\\
+John Storey \\
+Carl Icahn Labs \\
+Princeton University \\
+Princeton, NJ 08544 \\
+USA \\
+Email: jstorey@princeton.edu
+\\\
+\\
+
+\clearpage
+
+\clearpage
+
+<<methods, cache=FALSE>>=
+require(methods)
+@
+
+<<import_data>>=
+# import Bar-Seq data and the class methods
+load("input/replicates.RData")
+
+original = new("barcode.counts", counts=experiment.counts, design=experiment.design)
+original.combined = combine.counts(original, "tag")
+
+num.strains = sum(rowSums(original@counts) > 0)
+@
+
+<<process_data, dependson="import_data">>=
+counts = filter.counts(original.combined, min.reads=100, max.reads=1000000)
+@
+
+<<counts_obj, dependson="process_data">>=
+# "counts" means something different later: save this
+counts.obj = counts
+@
+
+<<levenshtein_matrices>>=
+# matrices using various levenshtein distances
+counts.0 = read.table("input/counts/BarNone_0m_counts.txt", header=TRUE, row.names=1)
+counts.1 = read.table("input/counts/BarNone_1m_counts.txt", header=TRUE, row.names=1)
+counts.2 = read.table("input/counts/BarNone_2m_counts.txt", header=TRUE, row.names=1)
+counts.3 = read.table("input/counts/BarNone_3m_counts.txt", header=TRUE, row.names=1)
+@
+
+%% Differential abundance
+
+<<pool_counts, dependson="import_data">>=
+pooled = combine.counts(counts, "technical")
+pooled = pooled[pooled@design$condition != "t0"]
+@
+
+<<subsample_proportions, dependson="pool_counts">>=
+#subsample.proportions = c(seq(0.002, .1, .001), seq(.103, 1, .003))
+subsample.proportions = c(seq(0.0025, .1, .0025), seq(.105, 1, .005))
+@
+
+<<edgeR, dependson="pool_counts">>=
+pooled.counts = differential.abundance(pooled, "YPD", "YPGAL", method="edgeR")
+@
+
+<<DESeq, dependson="edgeR">>=
+pooled.counts = differential.abundance(pooled.counts, "YPD", "YPGAL", method="DESeq")
+@
+
+<<significant.each, dependson="DESeq">>=
+significant.edgeR = pooled.counts@qvalue$edgeR < .05
+significant.DESeq = pooled.counts@qvalue$DESeq < .05
+@
+
+% SUBSAMPLING
+
+<<GSEA_prep>>=
+library(GSEABase)
+library(data.table)
+library(org.Sc.sgd.db)
+
+frame = toTable(org.Sc.sgdGO)
+frame = frame[frame$Ontology == "BP", ]
+goframeData = data.frame(frame$go_id, frame$Evidence, frame$systematic_name)
+
+goFrame=GOFrame(goframeData,organism="Saccharomyces cerevisiae")
+goAllFrame=GOAllFrame(goFrame)
+gsc <- GeneSetCollection(goAllFrame, setType = GOCollection())
+@
+
+<<setup_wilcox, dependson=c("GSEA_prep", "DESeq")>>=
+library(GO.db)
+
+GO = as.list(GOTERM)
+
+# filter
+all.genes = rownames(pooled.counts@counts)
+combined.names = sapply(gsc, function(g) paste(sort(intersect(g@geneIds, all.genes)), collapse="|"))
+set.sizes = sapply(gsc, function(g) length(g@geneIds))
+gsc = gsc[!duplicated(combined.names) & set.sizes > 3]
+
+gsc.terms = GO[names(gsc)]
+ontologies = sapply(gsc.terms, Ontology)
+
+gene.contained = sapply(gsc, function(g) all.genes %in% g@geneIds)
+
+# filter- must be BP and have at least 4 genes in the sample
+cond = ontologies == "BP" & colSums(gene.contained) >= 4
+gsc.filtered = gsc[cond]
+gene.contained = gene.contained[, cond]
+gsc.terms = gsc.terms[cond]
+@
+
+<<save_gene_contained, dependson="setup_wilcox">>=
+save(gene.contained, file="gene_contained.Rdata")
+@
+
+<<wilcoxon_test, dependson="setup_wilcox">>=
+wilcoxon.pvalues = apply(gene.contained, 2, function(g) wilcox.test(pooled.counts@logFC$edgeR[g], pooled.counts@logFC$edgeR[!g])$p.value)
+@
+
+<<load_barseq>>=
+load("input/BarSeq_experiment_080513.Rdata")
+
+# this defines depth as over the entire analysis; the paper
+# uses it within condition (half as much)
+summaries$depth = summaries$depth / 2
+@
+
+<<barseq_processed_graph, dependson="load_barseq", warning=FALSE>>=
+library(data.table)
+library(ggplot2)
+
+x = summaries[, general.design:=substr(design, 1, 6)]
+# combine the tech.1 and tech.2 levels
+summaries$general.design[summaries$general.design == "tech.2"] = "tech.1"
+summaries$general.design = factor(summaries$general.design)
+
+summaries$bio.reps = as.factor(c(2, 2, 3, 3, 4, 4, 4)[as.numeric(summaries$general.design)])
+summaries$tech.reps = as.factor(c(2, 1, 2, 1, 2, 1, 1)[as.numeric(summaries$general.design)])
+summaries$tech.reps = relevel(summaries$tech.reps, 2)
+
+summaries$FDR[is.na(summaries$FDR)] = 0
+
+# load the GSEA data from wilcox_significant.Rdata, which has the GSEA results
+# of all subsamples
+load("input/wilcox_significant.Rdata")
+
+summaries$GSEA = wilcox.significant
+
+predict.spline = function(x, y, df=20) {
+    main.spl = smooth.spline(x[order(x)], y[order(x)], df=df, all.knots=TRUE)
+    predict(main.spl)$y
+}
+
+summaries = summaries[order(summaries$general.design, summaries$depth), ]
+x = summaries[, fit:=predict.spline(depth, significant), by=general.design]
+x = summaries[, MSE.fit:=predict.spline(depth, MSE), by=general.design]
+x = summaries[, fdr.fit:=predict.spline(depth, FDR), by=general.design]
+x = summaries[, GSEA.fit:=predict.spline(depth, GSEA), by=general.design]
+
+# problematic artifact of the spline fitting:
+# some spline fits get confused right at the end of the line and drop precipitously
+# this occurs when one subdesign (set of replicates) goes on further than another
+# we trim precipitous drops right at the end
+trim.bad.end = function(x, threshold) {
+    # replace it with NA
+    diffs = diff(x)
+    change.indices = which(abs(x) > threshold)
+    # only look at last 5%
+    change.indices = change.indices[change.indices > length(x) * .9]
+    if (length(change.indices) > 0) {
+        x[change.indices[1]:length(x)] = NA
+    }
+    x
+}
+
+summaries = summaries[, fit:=trim.bad.end(fit, 100), by=c("bio.reps", "tech.reps")]
+summaries = summaries[, MSE.fit:=trim.bad.end(MSE.fit, .1), by=c("bio.reps", "tech.reps")]
+summaries = summaries[, fdr.fit:=trim.bad.end(fdr.fit, .02), by=c("bio.reps", "tech.reps")]
+summaries = summaries[, GSEA.fit:=trim.bad.end(GSEA.fit, 50), by=c("bio.reps", "tech.reps")]
+
+bio.rep.colors = scale_colour_manual(name="Biological Replicates", values=c("blue", "purple", "red"))
+tech.rep.lty = scale_linetype_manual(name="Technical Replicates", values=1:2)
+
+base.plot = ggplot(summaries, aes(x=depth, y=fit, col=bio.reps, lty=tech.reps)) + xlab("Read Depth per Condition") + ylab("Number of Significant Strains") + tech.rep.lty + bio.rep.colors + theme(axis.text.x = element_text(angle = 30, hjust = 1))
+p1 = base.plot + geom_line() + xlim(0, 25e6)
+p3 = base.plot + geom_line(aes(y=GSEA.fit)) + xlim(0, 25e6) + ylab("Number of Significant Gene Sets")
+@
+
+<<by_logFC, dependson="barseq_processed_graph">>=
+library(reshape)
+percents.logFC = data.table(melt(summaries[, list(depth, bio.reps, tech.reps,
+                                       percent, percent.logFC1.5, percent.logFC2)],
+                                       id=c("depth", "bio.reps", "tech.reps")))
+levels(percents.logFC$variable) = c("All", "1.5", "2")
+x = percents.logFC[, percent.fit:=predict.spline(depth, value),
+                by=c("bio.reps", "tech.reps", "variable")]
+@
+
+<<power_data, dependson="by_logFC">>=
+# judge the power of each method by where the spline curve is at the recommended 6 million
+full.dt = summaries[general.design == "Full", ]
+bio3.dt = summaries[general.design == "Bio.3.", ]
+bio2.dt = summaries[general.design == "Bio.2.", ]
+
+full.sig = approx(full.dt$depth, full.dt$fit, 6e6)$y
+bio3.sig = approx(bio3.dt$depth, bio3.dt$fit, 6e6)$y
+bio2.sig = approx(bio2.dt$depth, bio2.dt$fit, 6e6)$y
+
+percents.logFC.report = percents.logFC[bio.reps == 4 & tech.reps == 1, ]
+
+power.FC.depth = function(FC, depth) {
+	library(data.table)  # need to reimport because this is used in Sexpr
+	ss = percents.logFC.report[variable == FC, ]
+	approx(ss$depth, ss$percent.fit, depth)$y
+}
+@
+
+%\section{Abstract}
+
+\setcounter{secnumdepth}{-1}
+
+\textbf{High-throughput quantitative DNA sequencing enables the parallel phenotyping of pools of thousands of mutants.  However, the appropriate analytical methods and experimental design that maximize the efficiency of these methods while maintaining statistical power are currently unknown.  Here, we have used Bar-seq analysis of the \textit{Saccharomyces cerevisiae} yeast deletion library to systematically test the effect of experimental design parameters and sequence read depth on experimental results.  We present computational methods that efficiently and accurately estimate effect sizes and their statistical significance by adapting existing methods for RNA-seq analysis.  Using simulated variation of experimental designs we find that biological replicates are critical for statistical analysis of Bar-seq data whereas technical replicates are of less value.  By sub-sampling sequence reads we find that when using four-fold biological replication, 6 million reads per condition achieves \Sexpr{round(100 * power.FC.depth("2", 6e6))}\% power to detect $\geq$2-fold change at a 5\% false discovery rate (FDR).  \textcolor{red}{Our guidelines for experimental design and computational analysis enables} the study of the yeast deletion collection in up to 30 different conditions in a single sequencing lane.  These findings are relevant to a variety of pooled genetic screening methods that use high-throughput quantitative DNA sequencing including Tn-seq.} 
+
+\section{INTRODUCTION}
+
+Uncovering the connection between genotype and phenotype remains one of the central challenges of modern genetics.  At the same time, the rate at which new genomes are sequenced currently outpaces our capacity to functionally annotate those genomes.  Addressing these challenges requires efficient means of quantifying phenotypes associated with defined genetic perturbations.  Methods for uniquely identifying and quantifying phenotypic effects of mutant alleles in complex mixtures enables the parallel analysis of hundreds to thousands of genotypes.  Pooled mutant analysis entails the use of either libraries of defined mutants tagged with unique DNA sequences (molecular barcodes) \citep{Winzeler:1999wa,Giaever:2002gr} or complex libraries of tens of thousands of unique mutants generated by random insertional mutagenesis.  Analogously, comprehensive libraries of short hairpin RNAs (shRNAs) enables parallel analysis of perturbations of mammalian genes in cell culture \citep{Schlabach:2008hs, Silva:2008kg, Sims:2011jc}. 
+
+Recently, methods for estimating mutant abundances in complex mixtures have been introduced that capitalize on advances in high-throughput quantitative DNA sequencing.  \underline{Bar}code Analysis by \underline{Seq}uencing (Bar-seq) was first developed to analyze libraries of thousands of \textit{Saccharomyces cerevisiae} gene deletion mutants \citep{Smith:2009kr} and has subsequently been used to analyze a library of deletion mutants in \textit{Schizzosaccharomyces pombe} \citep{Han:2010ha}.  The use of Bar-seq enables efficient, accurate and comprehensive genetic screens for addressing a variety of questions such as defining the genetic requirements for initiation and maintenance of cell quiescence in response to distinct starvation signals \citep{Gresham:2011iq}.   In organisms for which barcoded mutant libraries are not available\textcolor{red}{,} high-throughput DNA sequencing of pools of transposon insertion mutants (Tn-seq) enables multiplexed mutant analysis.  Tn-seq was initially applied in studies of \textit{Streptococcus pneumonia} \citep{vanOpijnen:2009jv} and \textit{Haemophilus influenzae} \citep{Gawronski:2009co} and has subsequently been adapted for use in diverse organisms \citep{Brutinel:2012fz, Gallagher:2011jc}.  Similarly, PhiTSeq facilitates simultaneous analysis of thousands of transposon-mutagenized haploid human cells \citep{Carette:2011jb}.  The wide-spread adoption of pooled mutant screens using high-throughput quantitative DNA sequencing attests to the power of these methods for efficient genetic analysis.
+
+In contrast to the rapid technological advances in pooled mutant analysis, there has not yet been a statistical treatment of the \textcolor{red}{experimental design and analysis of} data generated by high-throughput DNA sequence analysis of these complex libraries.   Thus, major methodological and analytical questions remain unanswered. What is the appropriate statistical framework for analyzing DNA sequence count data? What are the sources of variation? What is the appropriate study design for maximizing the power and accuracy to detect differences in mutant abundances?  What sequence read depth maximizes the precision of these methods while minimizing the cost and resources required?
+
+We undertook a study that aimed to address these questions with the goal of providing guidance for the design and analysis of pooled mutant screens using high-throughput DNA sequencing.  Using experimental analysis of the \textit{S. cerevisiae} gene deletion collection in two different conditions we studied the contribution of treatment and biological and technical variation to Bar-seq data (\textbf{Figure 1}). We demonstrate that \textcolor{red}{the negative binomial model used to analyze RNA-seq data} is \textcolor{red}{also} directly applicable to Bar-seq \textcolor{red}{data}.  Using computational subsampling of our experimental data, we studied the effect of different experimental designs on the results from Bar-seq analysis.  We find that biological replicates substantially improve statistical power whereas technical replicates provide only moderate additional statistical power.  We also find that increasing sequencing depth beyond 6 million reads per condition provides \textcolor{red}{limited} improvement to the experimental results regardless of experimental design.  
+
+Our results provide information directly relevant to designing future high-throughput quantitative DNA sequencing experiments of pooled mutants. For example, using an experimental design of four-fold biological replication and no technical replication, we show that detection of mutants in the 4295 strain yeast deletion collection with $\geq$2-fold change between conditions can be achieved with \textcolor{red}{\Sexpr{round(100 * power.FC.depth("2", 6e6))}}\% power at a 5\% false discovery rate (FDR) using as few as \textcolor{red}{6} million reads per condition.  This corresponds to a requirement of \Sexpr{round(6e6 / NROW(counts@counts))} sequence reads per mutant per condition or 349 reads per biological replicate library.   Using our experimental and analytical methods for Bar-seq analysis it is possible to analyze the yeast deletion collection in up to 30 different conditions using a single 200 million read lane without sacrificing statistical power.  Our findings should be informative for other methods of pooled mutant analysis such as Tn-seq.
+
+\section{MATERIALS AND METHODS}
+
+<<misc_data>>=
+total.reads = 185.2e6
+
+total.mapped = sum(original@counts)
+percent.mapped = total.mapped / total.reads
+HO.index = which.max(rowSums(original@counts))
+percent.HO = sum(original@counts[HO.index, ]) / sum(original@counts)
+
+minimum.reads = 100
+
+num.strains = sum(rowSums(original@counts) > 0)
+num.outliers = sum(rowSums(original@counts) < minimum.reads & rowSums(original@counts) > 0)
+num.strains.filtered = NROW(counts@counts)
+
+num.non.HO = sum(original@counts[-HO.index, ])
+@
+
+\textbf{Strains, Media and Sampling Procedures}: We used a haploid prototrophic gene deletion collection constructed using the synthetic genetic array method \citep{Tong:2001ks}.  The library contains the identical gene deletion alleles as the standard yeast knockout collection \citep{Winzeler:1999wa} excluding gene deletions that result in auxotrophies.  Gene deletion alleles are marked with the kanMX4 cassette conferring G418 resistance, which is flanked by a unique 5' molecular barcode (the UPTAG) and a unique 3' molecular barcode (the DNTAG).  Each MAT\textbf{a} mutant contains a functional copy of the \textit{URA3}, \textit{LYS2}, \textit{LEU2}, \textit{MET15} genes and the \textit{can1$\Delta$::STE2$_{pr}$-SpHIS5}, \textit{lyp1$\Delta$0} and \textit{his3$\Delta$1} alleles.    We used standard YPD and YPGal media containing either 2\% glucose or 2\% galactose respectively \citep{Amberg:2005wg}.
+
+Following growth of individual mutants on YPD agar plates, all mutants were pooled to a final density of 1.5 x 10$^9$ cells/mL.  Each agar plate contained single colonies of individual genotypes and replicated colonies of the control \textit{HO$\Delta$0} strain. To define the replicated time-zero (t$_{0}$) samples we obtained two independent samples of 0.5mL (i.e. 7.5 x 10$^8$ cells) from the pooled library. We inoculated 5$\mu$L from the pooled library (i.e. 7.5 x 10$^6$ cells) into four-fold replicated cultures of either 5mL YPD or YPGal.  Cells were grown for 24 hours (t$_{0}$) to a final density of 3.3 x 10$^8$ cells/mL in both conditions.  We removed 2mL (i.e. 6.6 x 10$^8$ cells) samples from each of the four YPD cultures and four YPGal cultures and purified genomic DNA using Qiagen Genomic-Tip 100 columns.
+
+\textbf{Library Preparation and Sequencing}: We designed a two-step PCR protocol for efficient multiplexing of Bar-seq libraries.  In the first PCR step UPTAGs from a single sample were amplified with the primers \textit{Illumina UPTAG Index \#} (5'-ACG CTC TTC CGA TCT \underline{NNNNN} GTC CAC GAG GTC TCT-3') and \textit{Illumina UPkanMX} (CAA GCA GAA GAC GGC ATA CGA GAT GTC GAC CTG CAG CGT ACG-3') and DNTAGs from the same sample were amplified with the primers \textit{Illumina DNTAG Index \#} (5'-ACG CTC TTC CGA TCT \underline{NNNNN} GTG TCG GTC TCG TAG-3') and \textit{IlluminaDNkanMX} (5'-CAA GCA GAA GAC GGC ATA CGA GAT ACG AGC TCG AAT TCA TCG-3') in separate PCR reactions.  Illumina UPTAG and Illumina DNTAG primers contain a 5 base pair sequence (denoted \underline{NNNNN} in the primer sequence) that uniquely identifies the sample.  We designed 120 unique sample indices that differ by at least two nucleotides.  A complete list of primer sequences is provided in \textbf{Table S1}.  We normalized genomic DNA concentrations to 10ng/$\mu$L and using 100ng of template amplified barcodes using the following PCR program: 2 minutes at $98\,^{\circ}\mathrm{C}$ followed by 20 cycles of 10 seconds at $98\,^{\circ}\mathrm{C}$, 10 seconds at $50\,^{\circ}\mathrm{C}$ and 10 seconds at $72\,^{\circ}\mathrm{C}$ and a final extension step of 2 minutes at $72\,^{\circ}\mathrm{C}$.  PCR products were confirmed on 2\% agarose gels and purified using QIAquick PCR purification columns.
+
+We quantified purified PCR products using a Qubit fluorimeter and combined 60ng from each of the 20 different UPTAG libraries and, in a separate tube, 60ng from each of the 20 different DNTAG libraries.  The multiplexed UPTAG libraries were then amplified using the primers  \textit{P5} (5'-A ATG ATA CGG CGA CCA CCG AGA TCT ACA CTC TTT CCC TAC ACG ACG CTC TTC CGA TCT-3') and \textit{Illumina UPkanMX} and the combined DNTAG libraries were amplified using the \textit{P5} and \textit{IlluminaDNkanMX} primers using the identical PCR program as the first step with 20ng of template.  The 140 base pair UPTAG and DNTAG libraries were purified using QIAquick PCR purification columns, quantified using a Qubit fluorometer, combined in equimolar amounts and adjusted to a final concentration of 10nM (i.e. 0.924 ng/$\mu$L).  In total, the sequencing library contained 20 UPTAG and 20 DNTAG libraries from 20 different samples (\textbf{Table S2}).  The library was sequenced on a single lane of an Illumina HiSeq 2000 using standard methods including the use of the standard Illumina sequencing primer (5'-ACA CTC TTT CCC TAC ACG ACG CTC TTC CGA TCT-3'). The qseq files for each of the 20 samples are available from the NCBI Short Read Archive with the accession number SRA101498.
+
+\textbf{Read Matching and Statistical Analysis}: Sequence reads were matched to the yeast deletion collection barcodes reannotated by Smith et al 2009. Inexact matching was performed by identifying barcode sequences that are within a Levenshtein distance of 2 from each read \citep{Levenshtein:1966ts}. Reads matching equally to multiple barcodes were discarded. Sample indices were similarly matched using a maximum Levenshtein distance of 1. The final matrix of counts matching the UPTAG and DNTAG of each of the 20 samples is provided as \textbf{Table S3}. A set of \Sexpr{num.outliers} outliers was identified that had fewer than \Sexpr{minimum.reads} total reads across all 20 samples (\textbf{Figure S1}). These low-count matches are likely due to sequencing error, and were removed.  In addition, our pooled yeast gene deletion library included a highly abundant strain (the \textcolor{red}{HO} gene deletion mutant, \textcolor{red}{which was present on each of the 96-well plates containing individual mutants prior to pooling}).  The HO deletion mutant represented \Sexpr{round(percent.HO * 100, 1)}\% of all reads and was removed prior to computational analyses leaving a total of \Sexpr{round(num.non.HO / 1e6, 1)} million reads mapped to \Sexpr{num.strains.filtered} mutants.
+
+Eigen-$R^2$ was used to determine the percent of variance explained by the different factors in our experimental design for the t$_{24}$ samples \citep{Storey:2008p1092}. Barcode counts were \textcolor{red}{normalized using the TMM method \citep{Robinson:2010p9965}} after adding 1 to each value, and then were log-transformed, to avoid including differences in \textcolor{red}{per-library read depth} as a source of variation. The bottom 10\% of mutants were filtered out because lower counts have a disproportionate effect on the technical variation.  Eigen-$R^2$ was used to compute the percent of variance explained by the treatment factor ($R^2_T$) and the biological replicate factor ($R^2_B$). As the treatment factor is contained within the biological factor, we report the biological percent of variation as $R^2_B-R^2_T$, and the technical variation as $1-R^2_B-R^2_T$.
+
+For differential abundance analysis, we first summed UPTAGs and DNTAGs for technical replicates within each biological replicate. The \texttt{edgeR} package \textcolor{red}{(version 3.2.4) was used to perform dispersion estimation and to perform an exact negative binomial test to calculate a p-value and log fold change for each mutant using the \texttt{exactTest} function, using the default parameters} \citep{Robinson:2010p11822}. The \texttt{qvalue} package was used to compute q-values \citep{Storey:2003il}.
+
+Gene set enrichment analysis was performed using the Biological Process ontology from SGD. Gene sets that had fewer than four genes among the detected deletions were discarded in advance. We used the Wilcoxon rank-sum test to compare the distribution of the estimated log fold changes within each gene set to those outside of the set \citep{Gresham:2011iq}. We used the \texttt{qvalue} package to set a FDR=5\% threshold above which gene sets were declared significantly enriched.
+
+\textbf{Read Subsampling}: Separate subsamplings were performed for each combination of replicates in each design. This requires 1 combination for the full $2\times4\times2$ design, 2 combinations for the $2\times4\times1$ design, ${4\choose3}=4$ combinations for the $2\times3\times2$ design, ${4\choose3}\times2=8$ combinations for the $2\times3\times2$ design, ${4\choose2}=6$ combinations for the $2\times2\times2$ design, and ${4\choose2}\times2=12$ combinations for the $2\times2\times1$ design. For each combination, \textcolor{red}{ we performed subsampling over a sequence of 400 evenly spaced fractions of reads corresponding to $0.25\%, 0.50\%, \ldots, 99.75\%, 100\%$.}
+
+For each fraction $p$, a subsampled count matrix $S$ was generated based on the full experiment matrix, as $S_{i,j}\sim \mbox{Binom}(X_{i,j}, p)$. This is equivalent to choosing a random sample of the sequenced reads and then mapping them. \textcolor{red}{The same analysis steps used for the full data set were used} to analyze each subsample and the same metrics were applied to assess the results as used for the full experiment. 
+
+As the results for each experimental design depend on which of the replicates was chosen for subsampling, the results were smoothed for each experimental design using a natural cubic spline with 20 degrees of freedom for estimates of the power, accuracy and FDR. For estimates of the informativeness of each experimental design, we used 15 degrees of freedom as the number of significant gene sets identified in each subsample showed greater variance than the other three metrics.
+
+\section{RESULTS}
+
+\textbf{Experimental Results}: We aimed to dissect the sources of variation in pooled mutant screens and determine the appropriate analytical framework and experimental design that maximizes the value of the assay while minimizing cost and resources.  All pooled genetic screens using mixtures of mutants require 1) generation of a library of mutants, 2) experimental treatment of the pooled mutants, and 3) identification and quantification of DNA sequences that uniquely identify each mutant using high-throughput DNA sequencing.  We designed an experiment to compare growth of haploid yeast non-essential gene deletion mutants in two different carbon sources: glucose (YPD) and galactose (YPGal), using Bar-seq analysis of the molecular barcodes that uniquely identify each mutant.  To address the goals of our study we prepared four biological replicates grown for 24 hours in each condition and two technical replicates (i.e. independent sequencing library preparation of the same DNA sample) of each biological replicate (\textbf{Figure 1A} and \textbf{Table S2}). We also obtained two independent samples from the unselected library (time point 0) from which we prepared technical replicates.
+
+<<uptag_downtag_num_fold_change>>=
+# use the filtered for this one- don't count under 100-
+# but don't combine it by tag (of course)
+original.filtered = filter.counts(original, min.reads=100, max.reads=1000000)
+
+num_up = rowSums(original.filtered@counts[, original.filtered@design$tag == 1]) + 1
+num_dn = rowSums(original.filtered@counts[, original.filtered@design$tag == 2]) + 1
+num_up = num_up / sum(num_up)
+num_dn = num_dn / sum(num_dn)
+
+num.fold.change = function(b) sum(abs(log((num_up) / (num_dn), b)) > 1)
+
+num.not.t0 = sum(counts@counts[, counts@design$condition != "t0"])
+@
+
+To generate libraries for sequencing with an Illumina HiSeq, we designed a simple two stage PCR protocol (\textbf{methods}).  Each gene deletion is marked by two different molecular barcodes: one $5'$ (the UPTAG) and one $3'$ (the DNTAG) of the drug resistance cassette.  To multiplex sequencing of different Bar-seq libraries we developed a PCR-based method for library preparation that incorporates a unique sequence index for each library (\textbf{methods}). We sequenced 40 libraries (20 UPTAG and 20 DNTAG) from 20 samples in a single lane of an Illumina HiSeq 2000. We obtained \Sexpr{total.reads / 1e6} million reads that passed quality filters, and matched them to the molecular barcodes by identifying sequences within a Levenshtein edit distance of 2, which resulted in mapping  \Sexpr{round(100 * sum(counts.2) / total.reads, 1)}\% of reads. \textcolor{red}{Using a Levenshtein distance cutoff of 0 (i.e. an exact match) or 1 results in successful mapping of \Sexpr{round(100 * sum(counts.0) / total.reads, 1)}\% and \Sexpr{round(100 * sum(counts.1) / total.reads, 1)}\% of the reads respectively.}
+
+For the majority of mutants, the number of reads per barcode across all experiments follows an approximately log-normal distribution, and ranges between 1,000 - 100,000 (\textbf{Figure S1}).  Low-count outliers that likely result from sequencing errors were removed (\textbf{methods}). We found that UPTAGs and DNTAGs for each mutant had similar counts in the majority of samples, with \Sexpr{num.strains.filtered - num.fold.change(2)} mutants within a 2-fold difference of each other (\textbf{Figure S2}).  However, many mutants have highly divergent counts: \Sexpr{num.fold.change(10)} have more than a ten-fold difference and  \Sexpr{num.fold.change(100)} have more than a 100-fold difference. These discrepancies are likely due to one of the barcodes being lost due to sequencing error in either the barcode or PCR priming site.    
+
+<<percentvar, dependson="count_obj">>=
+library(xtable)
+library(edgeR)
+
+# note that eigenR2 is not currently in CRAN and has to be installed
+library(eigenR2)
+
+row.sums = rowSums(counts.obj@counts)
+
+not.t0 = counts.obj@design$condition != "t0"
+
+Treatment = counts.obj@design$condition[not.t0, drop=TRUE]
+Biological = counts.obj@design$biological[not.t0, drop=TRUE]
+
+library(DESeq)
+
+normalize = function(v) v / sum(v)
+
+counts.m = counts.obj@counts[, not.t0]
+
+TMM.factors = colSums(counts.m) * calcNormFactors(counts.m, method="TMM")
+DESeq.factors = estimateSizeFactorsForMatrix(counts.m)
+
+normalized.matrix.sizeFactor = log(t(t(counts.m + 1) / DESeq.factors))
+normalized.matrix.TMM = log(t(t(counts.m + 1) / TMM.factors))
+normalized.matrix.voom = voom(counts.m)$E
+
+percents.explained = function(input.m, min.count=0) {
+	m = input.m[row.sums >= min.count, ]
+	
+	eigenR2.treatment = eigenR2(dat=m, model=model.matrix(~ 1 + Treatment), adjust=TRUE)
+	eigenR2.bio = eigenR2(dat=m, model=model.matrix(~ 1 + Biological), adjust=TRUE)
+	
+	100 * diff(c(0, eigenR2.treatment$eigenR2, eigenR2.bio$eigenR2, 1))
+}
+
+quantiles = seq(0, .75, .05)
+bins = quantile(rowSums(counts.obj@counts), quantiles)
+
+matrices = list(normalized.matrix.TMM, normalized.matrix.voom, normalized.matrix.sizeFactor)
+var.data = do.call(rbind, lapply(matrices, function(m) {
+	data.frame(t(sapply(1:length(bins), function(i) {
+    		percents.explained(m, bins[i])
+	})))
+}))
+
+library(reshape)
+
+colnames(var.data) = c("Treatment", "Biological", "Technical")
+var.data$Method = rep(c("TMM (edgeR)", "Voom (limma)", "estimateSizeFactors (DESeq)"), each=length(bins))
+
+var.data$quantile = quantiles
+var.melt = melt(var.data, id=c("quantile", "Method"))
+
+reported.percents = percents.explained(normalized.matrix.TMM, quantile(row.sums, .1))
+@
+
+<<remove_scipen>>=
+options(scipen = 10000)
+@
+
+
+Correlation analysis of barcode counts shows that the lowest correlations are between mutant abundance in the unselected library (t$_0$) and mutant abundance following 24 hours of growth in either glucose- or galactose-containing media, indicating that differences in cell growth rates results in substantial changes in the relative abundance of mutants (\textbf{Figure 1B}).  Growth in YPD yields higher correlation with the t$_0$ sample than growth in YPGal, indicating that growth in galactose led to a greater shift in the mutants' relative abundances than did growth in glucose. To identify differential effects of mutants during growth in glucose and galactose, we restricted our analysis to the t$_{24}$ samples. We used eigen-$R^2$ \citep{Storey:2008p1092} to partition the variance among these samples, and found that \Sexpr{round(reported.percents[1], 1)}\% of the variance is explained by the treatment, \Sexpr{round(reported.percents[2], 1)}\% by biological variation, and  \Sexpr{round(reported.percents[3], 1)}\% by technical variation (\textbf{methods}). The apportionment of variance is consistent across a wide range of percentile thresholds and using a variety of normalization methods (\textbf{Figure S3}).
+
+\textbf{Computational Analysis of Differential Mutant Abundance}: The goal of pooled mutant screens is to identify mutants that exhibit differences in abundance as a result of a defined treatment.  The appropriate statistical methods depend on the nature of the data, which in the case of quantitative DNA sequencing of molecular barcodes are discrete count data. As we observed in \cite{Gresham:2011iq} the data are best described by an overdispersed Poisson distribution (i.e. the variance of biological replicates is greater than the mean) (\textbf{Figure S4}).  \textcolor{red}{The problem of comparing count data between samples with different read depths while assuming overdispersed Poisson variation is related to that presented by differential expression analysis of RNA-seq data, for which a negative binomial test is used.  In addition to the fact that Bar-seq data present some characteristics problematic for t-tests (i.e. lack of normality and a strong mean-variance relationship), there is an important motivation for utilizing models specifically designed for count data.  For example, consider two mutants in two different conditions where one's data is simply $1000 \times$ the other in read depth (e.g., counts 8 and 9 versus 13 and 14 for mutant $A$ and 8000 and 9000 versus 13000 and 14000 for mutant $B$). Whereas a t-test results in the same p-value for both mutants, a negative binomial model directly takes the difference in read depth into account resulting in drastically different p-values. Because the difference between the mutants with the lowest total number of reads to the highest number of reads is $\sim$2600-fold in our experiment (\textbf{Figure S1}), this is a valid issue to address. Therefore, we used a negative binomial model to test for mutants that are differentially abundant as a result of the treatment.}
+
+\textcolor{red}{We utilized the \texttt{edgeR} software package \citep{Robinson:2010p11822}, which has an efficient implementation of the negative binomial test that accounts for differing read depth and uses shrinkage to help estimate dispersion parameters.  We observed that dispersion estimates \textcolor{red}{undergo considerable shrinkage even when four biological replicates} are used (\textbf{Figure S4}). We found RNA-seq analysis methods that also fit a negative binomial model, such as that implemented in DESeq \citep{Anders:2010fu}, produce qualitatively comparable results (\textbf{Figure S5}).} Alternative methods, including DEGSeq \citep{Wang:2010vf} and Myrna \citep{Langmead:2010hj} make overdispersion assumptions less consistent with our data, whereas other methods, including Cuffdiff, use an implementation specific to RNA-seq \citep{Trapnell:2013gg}.
+
+Previous studies have used measurements of the UPTAG and DNTAG for each deletion mutant in different ways including selection of the barcode for each mutant with the highest count \citep{Smith:2010fd} and independent analysis of each barcode \citep{Gresham:2011iq}.  As the UPTAG and DNTAG are measurements of the same mutant, summing the counts within each sample provides a means of combining the information from both barcodes while remaining robust to cases where one barcode is lost.  Furthermore, with count data, summing across technical replicates provides a superior method for minimizing technical variation compared with calculating an average value.  Therefore, we summed UPTAGs and DNTAGs for each mutant over technical replicates, such that each condition has four biological replicates, and applied tests using a negative binomial model to identify mutants that are significantly different in abundance in YPGal compared with YPD after 24 hours of growth.  The sixteen samples comprising this dataset include a total of 112 million reads.
+
+\textcolor{red} {Analysis of our dataset identified \Sexpr{sum(significant.edgeR)} mutants that are differentially abundant between the two conditions at a 5\% FDR.}  The effect sizes of individual gene deletions are widely distributed (\textbf{Table S4} and \textbf{Figure 2A}).  Notably, \textcolor{red}{the gene deletion mutants for 8 of the 11} genes required for galactose metabolism \citep{Timson:2007vr} are significantly decreased in abundance in YPGal and mutants deleted for two genes known to repress galactose metabolism are significantly increased in abundance in YPGal (\textbf{Figure 2A}).  Gene set enrichment analysis using a Wilcoxon rank-sum test found \Sexpr{tail(wilcox.significant[names(wilcox.significant) == "Full_subsampled"], 1)} enriched gene sets at \textcolor{red}{FDR=5\%}, and the top sets are related to respiration and mitochondrial processes, consistent with the increased importance of respirative metabolism when yeast cells grow in galactose (\textbf{Table S5}). Mutants identified as significantly differing in abundance between YPGal and YPD are identified across a range of sequence read depths, \textcolor{red}{although smaller effect sizes tend to be called statistically significant as read depth increases (\textbf{Figure 2B})}.  The ability to detect significant changes in mutant abundance is not greatly affected when total read counts are greater than 1000, and two-fold differences are still detected as statistically significant with total read depths as low as 100.  These observations suggest that we oversampled in our study and that similar results would be obtained with approximately an order of magnitude fewer reads.    
+
+\textcolor{red}{\textbf{Effect of Experimental Design on Statistical Results}}: We aimed to identify the \textcolor{red}{experimental design} features that have the greatest effect on the results of a Bar-seq experiment.  In practice, the experimental considerations \textcolor{red}{that are most easily controlled are the} extent of biological and technical replication and the depth to which each library is sequenced.  We computationally simulated variation in each of these experiment design parameters using random subsampling of sequence reads from our complete experiment (\textbf{methods}).  For the purpose of assessing results from these subsamples we compared them to results obtained from analysis of the complete dataset, which we define as the gold standard.  \textcolor{red}{The negative binomial model we fit requires at least two biological replicates.}  Therefore, to study the effect of biological replication we simulated the use of experimental designs using 3 or 2 biological replicates while retaining two technical replicates for each sample.  To study the effect of technical replicates we simulated the use of experimental designs using one technical replicate for each of the biological replicates.  For each simulated experimental design we sampled a subset of the reads to simulate varying read depths.  We considered \textcolor{red}{four} metrics that assess the quality of each simulated experimental dataset: statistical power, accuracy, informativeness, and false discovery rate.  
+
+We assessed the power of each experimental design for different sequence read depths by determining the number of mutants identified as differentially abundant at FDR=5\%.  In all cases, the statistical power of each experimental design increases with read depth; however, it rapidly saturates (\textbf{Figure 3A}). Considering our full experimental design, it takes just \Sexpr{round(summaries[bio.reps == 4 & tech.reps == 2 & percent > .5][1, depth] / 1e6, 1)} million reads per condition to detect half of the significant mutants that are detected using the complete dataset and 75\% are detected with \Sexpr{round(summaries[bio.reps == 4 & tech.reps == 2 & percent > .75][1, depth] / 1e6, 1)} million reads per condition.  Mutants that are most differentially abundant can be detected at very low read depths: the \textcolor{red}{13 most significant mutants identified using the complete dataset are all identified as significant even at the lowest depth tested, 140,000 mapped reads (i.e. a 400-fold lower sequence read depth than the total), and are ranked among the 15 most significant mutants in all but the lowest read depth. Table S6 shows the effect size, significance and rank of the 7 most significant galactose-related genes at each level of subsampling, demonstrating that they remain highly significant even at very low read depths.}
+
+% Note: those values couldn't be calculated in this knitr document without including the full subsampling results (not just the summaries). If you load the full output of the Full subSeq run as a data.table called output, you can reproduce the results (though they will vary slightly depending on the random seed) with:
+
+% show that the 13 top strains are always significant
+% output$oracle.rank = rank(output[depth == max(depth)]$pvalue)
+% output[oracle.rank < 13, all(qvalue < .05), by=depth]
+
+% show that the 13 genes rank in the 15 most significant strains in all but the smallest (where they are in the top 21)
+% head(output[, max(rank(qvalue)[oracle.rank <= 13]), by=depth])
+
+Reducing the number of biological replicates results in reduced statistical power for a given read depth. Using three biological replicates rather than four decreases the statistical power by about \Sexpr{round((1 - bio3.sig / full.sig) * 100)}\%, and using only two biological replicates decreases it by \Sexpr{round((1 - bio2.sig / full.sig) * 100)}\%.  In practice, this effect is far more relevant than the read depth: 10 million mapped reads using two biological replicates achieves approximately the same power as 2 million total reads across four biological replicates, and the difference cannot be compensated by increasing sequence read depth.  Technical replicates only marginally increase the power of the experimental design.  This improvement is because pooling multiple replicates decreases the noise added by the library preparation, and therefore decreases the within-treatment variation, analogous to previously-studied strategies of pooling multiple replicates on a single microarray \citep{Peng:2003kn,Kendziorski:2005wt}.
+
+Although the maximum power possible with each experimental design differs, it is interesting to note that the point at which statistical power begins to asymptote is very similar across experimental design: at around 6 million reads per condition (\textbf{Figure 3A}).  This suggests that at this point, experimental noise attributable to the sequencing machine itself no longer decreases and additional variation is due to noise introduced by biological variability and library preparation.  Statistical power varies within each subset of the designs depending on which replicates were selected (\textbf{Figure S6}) indicating that different replicates added different amounts of variance to the experiment, which cannot be predicted \textit{a priori}.
+
+The utility of an experimental design can also be assessed in terms of the accuracy with which effect sizes are estimated, as quantified by the mean square error, the informativeness of the analysis, as quantified by the number of significant gene sets identified by gene set enrichment analysis, \textcolor{red}{or the false discovery rate, as quantified by the proportion of genes found significant that are not significant in the full experiment}.  Assessment of the quality of each experimental design considering accuracy (\textbf{Figure 3B}), informativeness (\textbf{Figure 3C}) and false discovery rate (\textbf{Figure 3D}) shows that the greatest improvements are found with addition of biological replicates and that improvements beyond 6 million reads per condition are minimal regardless of experimental design. \textcolor{red}{Although there is some variation in the point at which each metric ultimately saturates, the points at which each metric begins to asymptote are highly concordant.} Thus, beyond a surprisingly low threshold of 6 million reads per condition, additional sequencing depth provides little additional value.
+
+Although pooled mutant screens enable simultaneous sensitive measurement of each mutants' effect, they are frequently employed as a means of identifying those mutants of greatest effect.  We analyzed the statistical power of an experimental design using four biological replicates and no technical replication for different effect sizes \textbf{(Figure 4)}.  As few as 2.5 million sequence reads per condition (625,000 reads per sample) is sufficient to detect \Sexpr{round(power.FC.depth("2", 2.5e6) * 100)}\% of mutants that change more than two-fold in the full experiment.  Increasing the read depth to 6 million reads per condition detects \Sexpr{round(power.FC.depth("2", 6e6) * 100)}\% of all mutants that change more than two-fold, \Sexpr{round(power.FC.depth("1.5", 6e6) * 100)}\% of all mutants that change more than 1.5-fold and \Sexpr{round(power.FC.depth("All", 6e6) * 100)}\% of all mutants that are significant in the full experiment.      
+
+\section{DISCUSSION}
+
+High-throughput quantitative DNA sequencing has resulted in rapid advances in a range of problems from the analysis of genome variation to the three dimensional organization of genomes.  The coupling of high-throughput quantitative sequencing with large-scale mutagenesis (either systematic or random) enables the pooled analysis of mutant phenotypes with broad applications including the study of gene function, drug targets and genetic interactions.  Here, we have studied one realization of pooled mutant analysis - Bar-seq - with the goal of determining experimental design and analytical methods that provide excellent levels of sensitivity, specificity, and efficiency.
+
+We have shown that statistical models employed for RNA-seq analysis are directly applicable to the analysis of Bar-seq data. Tools for RNA-seq analysis, such as \textcolor{red}{those used here}, are therefore readily adapted to Bar-seq analysis providing estimates of effect sizes and statistical significance for each mutant.  For Bar-seq analysis, UPTAGs and DNTAGs represent additive measurements of the same genotype and therefore should be summed for each sample.  Similarly, technical replicates should be combined by addition of barcode counts.  
+
+Biological replication is essential for rigorous assessment of statistical significance.  At least two biological replicates should always be performed in order to use the within-treatment variation for determining statistical significance. Some software packages have the option of guessing the dispersion in advance, but this is not recommended as an incorrect estimate would make subsequent tests for statistical significance either too conservative or too generous.  Moreover, we have found that different experiments can contribute different amounts of variation. Therefore, we recommend performing at least four biological replicates in order to maximize statistical power and accuracy of effect size. The use of technical replicates of biological replicates results in marginal improvements and is likely unnecessary.
+
+Importantly, we found that Bar-seq does not require a high read depth to accurately detect differential abundances of mutants and that additional reads add little to the results. In our study using nearly 60 million mapped reads per condition to analyze \Sexpr{num.strains.filtered} mutants, we demonstrate that the quality of our dataset is maintained with approximately 10-fold fewer reads.  Our experimental method for Bar-seq includes 120 uniquely indexed adaptors (\textbf{Table S2}), meaning that on a 200 million read sequencing lane one can analyze four biological replicates of 30 different conditions, resulting in approximately 6 million reads per condition. Based on our analysis, that read depth would be expected to identify \Sexpr{round(power.FC.depth("2", 6e6) * 100)}\% of genes with a 2-fold change, \Sexpr{round(power.FC.depth("1.5", 6e6) * 100)}\% of mutants with a 1.5-fold change, and \Sexpr{round(power.FC.depth("All", 6e6) * 100)}\% of all mutants that would be detected with ten times greater read depth \textcolor{red}{and two technical replicates} (\textbf{Figure 4}). \textcolor{red}{These findings can be extended to other methods for pooled genetic screens by noting that it corresponds to $\sim$\Sexpr{round(6e6 / num.strains.filtered, -1)} reads per genomic target per condition.  Increasing sequence read depth beyond this value provides only an incremental increase.  Thus, our analysis provides guidelines about the tradeoff between per-condition read depth and statistical power that can be used for the design of future experiments.}
+
+\clearpage
+
+\section{Figure Legends}
+
+<<figure_1b, dependson="import_data", error=FALSE, include=FALSE, dev=c('tiff', 'jpeg'), dev.args=list(bg="white"), fig.width=5,fig.height=5, dpi=500>>=
+library(gplots)
+library(colorRamps)
+
+filtered = filter.counts(original, min.reads=100, max.reads=1000000)
+
+cormatrix = cor(counts.obj@counts, method="spearman")
+sample.names = paste(counts.obj@design$condition, c("A", "B", "C", "D", "A", "B", "C", "D", "A", "B")[counts.obj@design$biological], 1:2[rep(1:2, 10)], sep="_")
+rownames(cormatrix) = sample.names
+colnames(cormatrix) = sample.names
+
+par(mar=c(0, 0, 0, 0))
+heatmap.2(cormatrix, dendrogram="none", Rowv=NA, Colv=NA, trace="n", col = blue2yellow(1000), cexRow=.65, cexCol=.65, key=TRUE, density.info="none")
+@
+
+
+\noindent Figure 1. \textbf{Experimental design and results.} a) Our experimental design entailed two treatments (twenty-four hours of growth in glucose/YPD or galactose/YPGal), four biological replicates and two technical replicates, along with four samples at time point 0 (not shown in panel a). b) Heatmap of the Spearman correlation matrix of mutant counts by sample. Samples cluster according to time point, and also by treatment (YPD vs YPGal) and biological replicate.
+\\
+
+<<volcano_plot, dependson="DESeq">>=
+library(scales)
+GAL.table = read.table("input/GAL_genes.xls", header=TRUE, sep="\t")
+GAL.genes = GAL.table$Systematic[GAL.table$Repressor == "no"]
+GAL.repressors = GAL.table$Systematic[GAL.table$Repressor == "yes"]
+
+edgeR.results = data.frame(logFC=pooled.counts@logFC$edgeR, pvalue=pooled.counts@pvalue$edgeR,
+					   DESeq.pvalue=pooled.counts@pvalue$DESeq)
+edgeR.results$Gal = ifelse(rownames(pooled.counts@counts) %in% GAL.genes, "Pathway", ifelse(rownames(pooled.counts@counts) %in% GAL.repressors, "Repressor", "Significant"))
+edgeR.results$Reads = rowSums(pooled.counts@counts)
+edgeR.results$qvalue = pooled.counts@qvalue$edgeR
+
+# code from http://stackoverflow.com/questions/11053899
+reverseloglog_trans <- function(base = exp(1)) {
+    trans <- function(x) log(-log(x, base), base)
+    inv <- function(x) base^(-(base^x))
+    trans_new(paste0("reverseloglog-", format(base)), trans, inv, 
+              function(x) c(.1, 1e-05, 1e-25, 1e-100), 
+              domain = c(1e-300, Inf))
+}
+
+library(ggplot2)
+library(gridExtra)
+
+edgeR.results$Gal = factor(edgeR.results$Gal,
+                            levels=c("Pathway", "Repressor", "Significant"))
+edgeR.results$Deletion = rownames(pooled.counts@counts)
+
+edgeR.results$color = edgeR.results$Gal
+levels(edgeR.results$color) = c(levels(edgeR.results$color), "Not Significant")
+edgeR.results$color[edgeR.results$qvalue > .05] = "Not Significant"
+edgeR.results$color = factor(edgeR.results$color,
+                             levels=c("Not Significant", "Significant", "Pathway", "Repressor"))
+
+color.scale = scale_colour_manual(name="color", values=c("grey", "black", "red", "blue"))
+
+edgeR.results = edgeR.results[order(edgeR.results$color), ]
+volcano.plot = ggplot(edgeR.results, aes(x=qvalue, y=logFC, col=color)) + scale_x_continuous(trans=reverseloglog_trans(10)) + geom_point(size=2) + ylab("Log2(YPGal/YPD) FC") + xlab("EdgeR p-value") + theme(legend.direction = "horizontal", legend.position = "top") + color.scale + theme(axis.text.x = element_text(angle = 30, hjust = 1))
+pval.hist = ggplot2::qplot(edgeR.results$pvalue, binwidth=.03, xlim=0:1, xlab="EdgeR p-value", ylab="Frequency")
+logFC.hist = ggplot2::qplot(edgeR.results$logFC, binwidth=.25) + xlab("Log2(YPGal/YPD) Fold Change") + ylab("Frequency")
+@
+
+<<figure_2, dependson="volcano_plot", include=FALSE, dev=c('tiff', 'jpeg'), dev.args=list(bg="white"), fig.width=6,fig.height=6, dpi=500>>=
+library(gridExtra)
+
+g.a = textGrob(.5, unit(1,"npc") - unit(1,"line"), label="a)")
+g.b = textGrob(.5, unit(1,"npc") - unit(1,"line"), label="b)")
+
+smear.plot = ggplot(edgeR.results, aes(Reads, logFC, col=color)) + scale_x_log10() + geom_point() + theme(legend.position="none") + color.scale + ylab("Log2(YPGal/YPD) FC") + xlab("Reads per Strain")
+grid.arrange(g.a, volcano.plot, g.b, smear.plot, nrow=2, widths=c(.03, .97))
+@
+
+\noindent Figure 2. \textbf{Bar-seq quantifies mutant effects across a range of sequence read depths.} a) Volcano plot showing the relationship between the p-value (log-scale) and log fold change. Genes known to be involved in activation or repression of the galactose utilization pathway are highlighted. The p-value of the \textcolor{red}{rightmost red} point \textcolor{red}{is computationally indistinguishable from 0}. b) Plot of reads per mutant in the entire experiment compared with the estimated fold change following treatment.
+\\
+<<figure_3, dependson=c("go_term_graph", "barseq_processed_graph"), results=FALSE, include=FALSE, dev=c('tiff', 'jpeg'), dev.args=list(bg="white"), fig.width=7,fig.height=7, dpi=500>>=
+p2 = base.plot + geom_line(aes(y=MSE.fit)) + xlim(0, 25e6) + ylab("MSE Compared to Full Experiment")
+
+p4 = base.plot + geom_line(aes(y=fdr.fit)) + xlim(0, 25e6) + ylab("FDR Relative to Full Experiment")
+
+g_legend <- function(a.gplot) {
+	tmp <- ggplot_gtable(ggplot_build(a.gplot))
+	leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+	legend <- tmp$grobs[[leg]]
+	return(legend)
+}
+
+legend<-g_legend(p1 + theme(legend.position="top"))
+
+## using grid.arrange for convenience
+## could also manually push viewports
+library(grid)
+library(gridExtra)
+
+g.a = textGrob(.5, unit(1,"npc") - unit(1,"line"), label="a)")
+g.b = textGrob(.5, unit(1,"npc") - unit(1,"line"), label="b)")
+g.c = textGrob(.5, unit(1,"npc") - unit(1,"line"), label="c)")
+g.d = textGrob(.5, unit(1,"npc") - unit(1,"line"), label="d)")
+g.n = textGrob(.5, unit(1,"npc") - unit(1,"line"), label="")
+
+f3 = grid.arrange(legend,
+	arrangeGrob(g.a, p1 + theme(legend.position="none"), 
+                          #g.n, legend,
+                          g.b, p2 + theme(legend.position="none"),
+                          g.c, p3 + theme(legend.position="none"),
+                          g.d, p4 + theme(legend.position="none"),
+                          widths=c(.03, .47, .03, .47), nrow=2),
+                 nrow=2, heights=c(.1, .9))
+
+print(f3)
+@
+
+\noindent Figure 3. \textbf{Simulation analysis of variation in experimental design.} The effect of read depth on a) the number of mutants \textcolor{red}{found significant at FDR=5\%}, b) the mean squared error between the estimate of the log fold change and the value for the full experiment, c) the number of significant GO terms identified using a Wilcoxon rank sum test at FDR=5\%, \textcolor{red}{and d) the percentage of significant genes that were \emph{not} found as significant in the full experiment}. Curves are shown for the full experiment, 2 treatments x 4 biological replicates x 2 technical replicates, as well as for subsampled $2 \times 3 \times 2$, $2 \times 2 \times 2$ experimental designs (solid lines).  Subsamplings were also performed to simulate each experimental design using a single technical replicate (dashed lines).   Each curve was smoothed using a natural cubic spline.
+\\
+
+<<figure_4, dependson="by_logFC", include=FALSE, dev=c('tiff', 'jpeg'), dev.args=list(bg="white"), fig.width=5.5,fig.height=5.5, dpi=500>>=
+library(ggplot2)
+print(ggplot(percents.logFC.report, aes(depth, percent.fit, lty=variable)) + geom_line(col="red") +
+                scale_x_continuous(breaks=seq(0, 16e6, 2e6), limits=c(0, 16e6)) +
+                geom_hline(aes(yintercept=.9), lty=2, col="black") +
+                scale_y_continuous(breaks=seq(0, 1, .1)) +
+                theme(axis.text.x = element_text(angle = 30, hjust = 1)) +
+                scale_linetype_manual(name = "Fold Change Threshold", values=c(2, 3, 1)) +
+                xlab("Read Depth Per Condition") + ylab("Proportion of Genes Identified As Significant"))
+@
+
+\noindent Figure 4. \textbf{Statistical power varies with effect size and sequence read depth.} The effect of read depth on the proportion of genes identified as significant (FDR=5\%) at different fold-change thresholds using 4 biological replicates x 1 technical replicate for each condition.  The fold change for each mutant determined from the full \textcolor{red}{4 biological replicate x 2 technical replicate} experiment is defined as the gold standard. The solid curve shows the proportion of genes found significant relative to the total experiment, while the dotted and dashed curves show the proportion of mutants that had at least a 1.5- or a 2-fold change, respectively. The horizontal dashed line indicates the 90\% power level.
+\\
+
+<<figure_S1, dependson="import_data", include=FALSE>>=
+library(ggplot2)
+
+ggplot(data.frame(x=rowSums(original@counts)), aes(x=x)) + geom_histogram() + xlab("Reads per strain") + scale_x_log10() + ylab("Frequency")
+@
+
+\noindent Figure S1. \textbf{Distribution of the number of reads for all identified mutants.}  Most mutants follow an approximately log-normal distribution in terms of their abundance, with an additional group of mutants that had fewer than 100 counts across all 20 samples, probably due to sequencing error.
+\\
+
+<<figure_S2, dependson="import_data", fig.height=5, fig.width=7.5, results="hide", include=FALSE>>=
+library(ggplot2)
+nonmax = filter.counts(original, max.reads=10000000)
+up_totals = rowSums(nonmax@counts[, nonmax@design$tag == 1])
+dn_totals = rowSums(nonmax@counts[, nonmax@design$tag == 2])
+totals = data.frame(Up=up_totals, Down=dn_totals)
+ggplot(totals, aes(x=Up, y=Down)) + geom_point()
+@
+
+\noindent Figure S2. \textbf{Comparison of UPTAG and DNTAG counts for each mutant.} While the counts were closely correlated for many mutants, a large proportion of mutants had unusually low counts for one barcode, with some missing either an UPTAG or DNTAG entirely, probably due to a mutation in the barcode or the primer. 
+\\
+
+<<prepare_DGE>>=
+library(edgeR)
+
+#unfiltered = combine.counts(combine.counts(original, "tag"), "technical")
+#unfiltered = filter.counts(unfiltered, min.reads=100, max.reads=1e6)
+#unfiltered = unfiltered[unfiltered@design$condition != "t0"]
+
+maincounts = pooled.counts[pooled.counts@design$condition != "t0"]
+
+dge = DGEList(maincounts@counts[rowSums(maincounts@counts) >= 100, ], group=maincounts@design$condition)
+dge = estimateTagwiseDisp(dge)
+dge = estimateCommonDisp(dge)
+@
+
+<<figure_S3, dependson="percentvar", include=FALSE>>=
+library(ggplot2)
+
+print(ggplot(var.melt, aes(quantile, value, col=Method, lty=variable)) + geom_line() +
+      xlab("Percentile Threshold") + ylab("Percent of Variance Explained") +
+      ylim(0, 100) + scale_x_continuous(breaks=seq(0, .75, .25), lim=c(0, .75)) + scale_colour_discrete(name = "Source"))
+@
+
+\noindent Figure S3. The percent of variance explained by treatment and biological and technical replication as determined by eigen-$R^2$.  The results are qualitatively identical regardless of the normalization method and the percentile threshold for the minimum number of required reads for inclusion of a mutant.
+\\
+
+<<figure_S4, dependson="prepare_DGE", include=FALSE>>=
+#par(mfrow=c(2, 1))
+plotMeanVar(dge, show.raw.vars=TRUE, show.tagwise.vars=TRUE, xlab="Mean abundance level (log10 scale)", ylab="Variance of abundance level (log10 scale)")
+#plotBCV(dge)
+@
+
+\noindent Figure S4. \textbf{Comparison of mean barcode count with the associated variance.} \textcolor{red}{Grey points are the raw measurements for each strain, the red X's are the average variance in each bin, and the blue points are the estimated variance of each strain \textcolor{red}{after dispersion shrinkage} has been performed.}  Variance tends to be substantially greater than the mean suggesting that a overdispersed Poisson or negative binomial model is appropriate.
+\\
+
+<<figure_S5, dependson="DESeq", include=FALSE>>=
+library(ggplot2)
+ggplot(data=pooled.counts@pvalue, aes(x=edgeR, y=DESeq)) + geom_point()
+@
+
+\noindent Figure S5. \textbf{P-values for the YPD/YPGal comparison for each strain, calculated using \textcolor{red}{ the  negative binomial models with \texttt{edgeR} and \texttt{DESeq}}.} The methods show a Spearman correlation of \Sexpr{round(cor(pooled.counts@pvalue$edgeR, pooled.counts@pvalue$DESeq, method="spearman"), 3)}, indicating only slight differences in their approach.
+\\
+
+<<figure_S6, fig.width=10, dependson="barseq_processed_graph", include=FALSE>>=
+data.2.reps = subset(summaries, summaries$tech.reps == 2)
+base.plot + geom_point(data=data.2.reps, aes(y=significant, col=bio.reps), size=1) + geom_line(data=data.2.reps) + xlim(0, 25e6)
+@
+
+\noindent Figure S6. \textbf{The number of significant mutants at different read depths for different subsets of subsampling experiments}.  A spline is fit to the results for each of comparison.
+
+\clearpage
+
+\section{Supplementary Table Legends}
+
+
+
+\noindent Table S1. 120 UPTAG and DNTAG indexed primer sequences for multiplexed Bar-seq analysis of the yeast deletion collection.
+\\
+\\
+Table S2. The UPTAG and DOWNTAG primer and index used for each of the 20 samples analyzed in the current study.
+\\
+
+<<table_dir>>=
+dir.create("tables", showWarnings = FALSE)
+@
+
+<<table_S3, dependson="import_data">>=
+bio.names = c("A", "B", "C", "D", "A", "B", "C", "D", "A", "B")
+design.names = paste(experiment.design$condition, bio.names[experiment.design$biological], rep(1:2, 10, each=2), c("UP", "DN"), sep="_")
+matrix.table = as.data.frame(experiment.counts)
+colnames(matrix.table) = design.names
+
+library(org.Sc.sgd.db)
+nameindex = as.list(org.Sc.sgdGENENAME)
+
+incl = rowSums(experiment.counts) > 100 & rowSums(experiment.counts) < 1000000
+
+matrix.table = cbind(Strain=rownames(matrix.table), Gene=as.character(nameindex[rownames(matrix.table)]), Included=incl, matrix.table)
+matrix.table = matrix.table[order(-matrix.table$Included), ]
+
+write.table(matrix.table, file="tables/table_S3.xls", sep="\t", quote=FALSE, row.names=FALSE)
+@
+
+\noindent Table S3. The matrix of raw read counts that matched to each tag in each replicate. The first three columns give the systematic and gene name of the deletion and an indication as to whether the mutant was among the 4295 included in the analysis.
+\\
+
+<<table_S4, dependson="volcano_plot">>=
+# rearrange rows and columns
+edgeR.results = edgeR.results[order(edgeR.results$pvalue), ]
+
+library(org.Sc.sgd.db)
+nameindex = as.list(org.Sc.sgdGENENAME)
+edgeR.results$Gene = as.character(nameindex[edgeR.results$Deletion])
+
+edgeR.results$Gene[is.na(edgeR.results$Gene)] = edgeR.results$Deletion[is.na(edgeR.results$Gene)]
+
+# reorder, remove and rename some columns
+library(qvalue)
+edgeR.results$DESeq.qvalue = qvalue(edgeR.results$DESeq.pvalue)$qvalue
+edgeR.results = edgeR.results[c("Deletion", "Gene", "pvalue", "qvalue", "DESeq.pvalue", "DESeq.qvalue", "Gal", "Reads", "logFC")]
+colnames(edgeR.results) = c("Deletion", "Gene", "edgeR pvalue", "edgeR qvalue", "DESeq pvalue", "DESeq qvalue", "Gal", "Reads", "logFC")
+write.table(edgeR.results, file="tables/table_S4.xls", quote=FALSE, row.names=FALSE, sep="\t")
+@
+\noindent Table S4. The p-value and q-value for the test for differential abundance using both DESeq and edgeR for each mutant. Also shown are the estimated log$_2$ fold changes, the total number of reads matching the gene across both conditions, and the annotation of the biological process indicated in Figure 2.
+\\
+
+<<table_S5, dependson="wilcoxon_test">>=
+library(qvalue)
+
+ids = names(gsc.terms)
+terms = sapply(gsc.terms, Term)
+definitions = sapply(gsc.terms, Definition)
+go.term.table = data.frame(GOID=ids, Term=terms, Definition=definitions, Number=colSums(gene.contained), pvalue=wilcoxon.pvalues, qvalue=qvalue(wilcoxon.pvalues)$qvalue)
+go.term.table = go.term.table[order(go.term.table$qvalue), ]
+
+write.table(go.term.table, file="tables/table_S5.xls", quote=FALSE, row.names=FALSE, sep="\t")
+@
+
+\noindent Table S5. The p-values for gene set enrichment analysis using the Wilcoxon rank-sum test on the estimated log$_2$ fold changes. The gene sets shown are those in the Biological Process ontology that had at least four genes in the set of analyzed deletions.
+\\
+
+\noindent Table S6. The estimated log fold change, q-value, and significance rank for the 7 most significant GAL genes at each of the 400 levels of read subsampling.
+
+\clearpage
+
+\section{Acknowledgements}
+We thank members of the Gresham and Storey labs for helpful discussions.  We thank Amy Caudy and David Hess for construction of the prototrophic deletion collection and Zachary Kurtz for design of sample index primers.  This work was supported by the National Science Foundation (MCB-1244219 to D.G.), the National Institutes of Health (1R01GM107466 to D.G., R01HG002913 and R21HG006769 to J.D.S.) and a Dupont Young Professor Award to D.G.
+
+<<save_data>>=
+counts = counts.obj
+
+save.counts = counts[counts@design$condition != "t0"]
+
+save.counts@design$biological = rep(1:4, 2, each=2)
+save.counts@design$technical = rep(1:2, 8)
+
+Full = combine.counts(save.counts, c("technical"))
+
+bio.2 = apply(combn(4, 2), 2, function(pair) {
+	combine.counts(save.counts[save.counts@design$biological %in% pair], c("technical"))
+})
+names(bio.2) = apply(combn(4, 2), 2, function(pair) paste("Bio.2.", pair[1], ".", pair[2], sep=""))
+
+bio.3 = apply(combn(4, 3), 2, function(pair) {
+	combine.counts(save.counts[save.counts@design$biological %in% pair], c("technical"))
+})
+names(bio.3) = apply(combn(4, 3), 2, function(pair) paste("Bio.3.", pair[1], ".", pair[2], ".", pair[3], sep=""))
+
+
+tech.1 = save.counts[save.counts@design$technical == 1]
+tech.2 = save.counts[save.counts@design$technical == 2]
+
+subsets = c(list(Full=Full, tech.1=tech.1, tech.2=tech.2), bio.2, bio.3)
+
+# smaller subsets
+
+combinations.3 = combn(4, 3)
+
+for (b in 1:NCOL(combinations.3)) {
+	for (tech in 1:2) {
+		bio.set = combinations.3[, b]
+		sub = list(save.counts[save.counts@design$biological %in% bio.set & save.counts@design$technical == tech])
+		names(sub) = paste("Bio.31", paste(bio.set, collapse="."), tech, sep=".")
+		subsets = c(subsets, sub)
+	}
+}
+
+combinations.2 = combn(4, 2)
+
+for (b in 1:NCOL(combinations.2)) {
+	for (tech in 1:2) {
+		bio.set = combinations.2[, b]
+		sub = list(save.counts[save.counts@design$biological %in% bio.set & save.counts@design$technical == tech])
+		names(sub) = paste("Bio.21", paste(bio.set, collapse="."), tech, sep=".")
+		subsets = c(subsets, sub)
+	}
+}
+
+# turn each subset into a matrix with column names that are conditions
+subsets = lapply(subsets, function(s) {
+	ret = s@counts
+	colnames(ret) = s@design$condition
+	ret
+})
+
+save(subsets, file="BarSeq_subsets.Rdata")
+
+@
+
+\bibliographystyle{abbrv}
+\begin{thebibliography}{10}
+
+\bibitem{Amberg:2005wg}
+D.~C. Amberg, D.~Burke, and J.~N. Strathern.
+\newblock {\em {Methods in Yeast Genetics}}.
+\newblock A Cold Spring Harbor Laboratory Course Manual. CSHL Press, 2005.
+
+\bibitem{Anders:2010fu}
+S.~Anders and W.~Huber.
+\newblock Differential expression analysis for sequence count data.
+\newblock {\em Genome biology}, 11(10):R106, 2010.
+
+\bibitem{Brutinel:2012fz}
+E.~D. Brutinel and J.~A. Gralnick.
+\newblock {Anomalies of the anaerobic tricarboxylic acid cycle in Shewanella
+  oneidensis revealed by Tn-seq.}
+\newblock {\em Molecular microbiology}, 86(2):273--283, Oct. 2012.
+
+\bibitem{Carette:2011jb}
+J.~E. Carette, C.~P. Guimaraes, I.~Wuethrich, V.~A. Blomen, M.~Varadarajan,
+  C.~Sun, G.~Bell, B.~Yuan, M.~K. Muellner, S.~M. Nijman, H.~L. Ploegh, and
+  T.~R. Brummelkamp.
+\newblock {Global gene disruption in human cells to assign genes to phenotypes
+  by deep sequencing.}
+\newblock {\em Nature Biotechnology}, 29(6):542--546, June 2011.
+
+\bibitem{Storey:2008p1092}
+L.~Chen and J.~Storey.
+\newblock {Eigen-R2 for dissecting variation in high-dimensional studies}.
+\newblock {\em Bioinformatics}, 2008.
+
+\bibitem{Gallagher:2011jc}
+L.~A. Gallagher, J.~Shendure, and C.~Manoil.
+\newblock {Genome-scale identification of resistance functions in Pseudomonas
+  aeruginosa using Tn-seq.}
+\newblock {\em mBio}, 2(1):e00315--10, 2011.
+
+\bibitem{Gawronski:2009co}
+J.~D. Gawronski, S.~M.~S. Wong, G.~Giannoukos, D.~V. Ward, and B.~J. Akerley.
+\newblock {Tracking insertion mutants within libraries by deep sequencing and a
+  genome-wide screen for Haemophilus genes required in the lung.}
+\newblock {\em Proceedings of the National Academy of Sciences of the United
+  States of America}, 106(38):16422--16427, Sept. 2009.
+
+\bibitem{Giaever:2002gr}
+G.~Giaever, A.~M. Chu, L.~Ni, C.~Connelly, L.~Riles, S.~V{\'e}ronneau, S.~Dow,
+  A.~Lucau-Danila, K.~Anderson, B.~Andr{\'e}, A.~P. Arkin, A.~Astromoff,
+  M.~El-Bakkoury, R.~Bangham, R.~Benito, S.~Brachat, S.~Campanaro, M.~Curtiss,
+  K.~Davis, A.~Deutschbauer, K.-D. Entian, P.~Flaherty, F.~Foury, D.~J.
+  Garfinkel, M.~Gerstein, D.~Gotte, U.~G{\"u}ldener, J.~H. Hegemann, S.~Hempel,
+  Z.~Herman, D.~F. Jaramillo, D.~E. Kelly, S.~L. Kelly, P.~K{\"o}tter,
+  D.~LaBonte, D.~C. Lamb, N.~Lan, H.~Liang, H.~Liao, L.~Liu, C.~Luo,
+  M.~Lussier, R.~Mao, P.~Menard, S.~L. Ooi, J.~L. Revuelta, C.~J. Roberts,
+  M.~Rose, P.~Ross-Macdonald, B.~Scherens, G.~Schimmack, B.~Shafer, D.~D.
+  Shoemaker, S.~Sookhai-Mahadeo, R.~K. Storms, J.~N. Strathern, G.~Valle,
+  M.~Voet, G.~Volckaert, C.-y. Wang, T.~R. Ward, J.~Wilhelmy, E.~A. Winzeler,
+  Y.~Yang, G.~Yen, E.~Youngman, K.~Yu, H.~Bussey, J.~D. Boeke, M.~Snyder,
+  P.~Philippsen, R.~W. Davis, and M.~Johnston.
+\newblock {Functional profiling of the Saccharomyces cerevisiae genome}.
+\newblock {\em Nature}, 418(6896):387--391, July 2002.
+
+\bibitem{Gresham:2011iq}
+D.~Gresham, V.~M. Boer, A.~Caudy, N.~Ziv, N.~J. Brandt, J.~D. Storey, and
+  D.~Botstein.
+\newblock {System-level analysis of genes and functions affecting survival
+  during nutrient starvation in Saccharomyces cerevisiae.}
+\newblock {\em Genetics}, 187(1):299--317, Jan. 2011.
+
+\bibitem{Han:2010ha}
+T.~X. Han, X.-Y. Xu, M.-J. Zhang, X.~Peng, and L.-L. Du.
+\newblock {Global fitness profiling of fission yeast deletion strains by
+  barcode sequencing.}
+\newblock {\em Genome biology}, 11(6):R60, 2010.
+
+\bibitem{Kendziorski:2005wt}
+C.~Kendziorski, R.~A. Irizarry, K.~S. Chen, J.~D. Haag, and M.~N. Gould.
+\newblock {On the utility of pooling biological samples in microarray
+  experiments}.
+\newblock {\em PNAS}, 2005.
+
+\bibitem{Langmead:2010hj}
+B.~Langmead, K.~D. Hansen, and J.~T. Leek.
+\newblock {Cloud-scale RNA-sequencing differential expression analysis with
+  Myrna.}
+\newblock {\em Genome biology}, 11(8):R83, 2010.
+
+\bibitem{Levenshtein:1966ts}
+V.~Levenshtein.
+\newblock {Binary codes capable of correcting deletions, insertions and
+  reversals}.
+\newblock {\em Soviet Physics Doklady}, 10:707–710, 1966.
+
+\bibitem{Peng:2003kn}
+X.~Peng, C.~L. Wood, E.~M. Blalock, K.~Chen, P.~W. Landfield, and A.~J.
+  Stromberg.
+\newblock {Statistical implications of pooling RNA samples for microarray
+  experiments}.
+\newblock {\em BMC Bioinformatics}, 4(1):26, 2003.
+
+\bibitem{Robinson:2010p11822}
+M.~Robinson and D.~McCarthy.
+\newblock edger: a bioconductor package for differential expression analysis of
+  digital gene expression data.
+\newblock {\em Bioinformatics}, 26(1):139--40, 2010.
+
+\bibitem{Robinson:2010p9965}
+M.~Robinson and A.~Oshlack.
+\newblock {A scaling normalization method for differential expression analysis
+  of RNA-seq data}.
+\newblock {\em Genome biology}, 11(3):R25, 2010.
+
+\bibitem{Schlabach:2008hs}
+M.~R. Schlabach, J.~Luo, N.~L. Solimini, G.~Hu, Q.~Xu, M.~Z. Li, Z.~Zhao,
+  A.~Smogorzewska, M.~E. Sowa, X.~L. Ang, T.~F. Westbrook, A.~C. Liang,
+  K.~Chang, J.~A. Hackett, J.~W. Harper, G.~J. Hannon, and S.~J. Elledge.
+\newblock {Cancer proliferation gene discovery through functional genomics}.
+\newblock {\em Science (New York, NY)}, 319(5863):620--624, Feb. 2008.
+
+\bibitem{Silva:2008kg}
+J.~M. Silva, K.~Marran, J.~S. Parker, J.~Silva, M.~Golding, M.~R. Schlabach,
+  S.~J. Elledge, G.~J. Hannon, and K.~Chang.
+\newblock {Profiling Essential Genes in Human Mammary Cells by Multiplex RNAi
+  Screening}.
+\newblock {\em Science (New York, NY)}, 319(5863):617--620, Feb. 2008.
+
+\bibitem{Sims:2011jc}
+D.~Sims, A.~M. Mendes-Pereira, J.~Frankum, D.~Burgess, M.-A. Cerone,
+  C.~Lombardelli, C.~Mitsopoulos, J.~Hakas, N.~Murugaesu, C.~M. Isacke,
+  K.~Fenwick, I.~Assiotis, I.~Kozarewa, M.~Zvelebil, A.~Ashworth, and C.~J.
+  Lord.
+\newblock {High-throughput RNA interference screening using pooled shRNA
+  libraries and next generation sequencing.}
+\newblock {\em Genome biology}, 12(10):R104, 2011.
+
+\bibitem{Smith:2009kr}
+A.~M. Smith, L.~E. Heisler, J.~Mellor, F.~Kaper, M.~J. Thompson, M.~Chee, F.~P.
+  Roth, G.~Giaever, and C.~Nislow.
+\newblock {Quantitative phenotyping via deep barcode sequencing.}
+\newblock {\em Genome research}, 19(10):1836--1842, Oct. 2009.
+
+\bibitem{Smith:2010fd}
+A.~M. Smith, L.~E. Heisler, R.~P. St~Onge, E.~Farias-Hesson, I.~M. Wallace,
+  J.~Bodeau, A.~N. Harris, K.~M. Perry, G.~Giaever, N.~Pourmand, and C.~Nislow.
+\newblock {Highly-multiplexed barcode sequencing: an efficient method for
+  parallel analysis of pooled samples.}
+\newblock {\em Nucleic Acids Research}, 38(13):e142, July 2010.
+
+\bibitem{Storey:2003il}
+J.~D. Storey and R.~Tibshirani.
+\newblock Statistical significance for genomewide studies.
+\newblock {\em Proc Natl Acad Sci}, 100(16):9440--5, Aug 2003.
+
+\bibitem{Timson:2007vr}
+D.~J. Timson.
+\newblock {Galactose metabolism in Saccharomyces cerevisiae}.
+\newblock {\em Dynamic Biochemistry}, 2007.
+
+\bibitem{Tong:2001ks}
+A.~H. Tong, M.~Evangelista, A.~B. Parsons, H.~Xu, G.~D. Bader, N.~Pag{\'e},
+  M.~Robinson, S.~Raghibizadeh, C.~W. Hogue, H.~Bussey, B.~Andrews, M.~Tyers,
+  and C.~Boone.
+\newblock {Systematic genetic analysis with ordered arrays of yeast deletion
+  mutants.}
+\newblock {\em Science}, 294(5550):2364--2368, Dec. 2001.
+
+\bibitem{Trapnell:2013gg}
+C.~Trapnell, D.~G. Hendrickson, M.~Sauvageau, L.~Goff, J.~L. Rinn, and
+  L.~Pachter.
+\newblock {Differential analysis of gene regulation at transcript resolution
+  with RNA-seq.}
+\newblock {\em Nature biotechnology}, 31(1):46--53, Jan. 2013.
+
+\bibitem{vanOpijnen:2009jv}
+T.~van Opijnen, K.~L. Bodi, and A.~Camilli.
+\newblock {Tn-seq: high-throughput parallel sequencing for fitness and genetic
+  interaction studies in microorganisms.}
+\newblock {\em Nature methods}, 6(10):767--772, Oct. 2009.
+
+\bibitem{Wang:2010vf}
+L.~Wang, Z.~Feng, X.~Wang, and X.~Wang.
+\newblock {DEGseq: an R package for identifying differentially expressed genes
+  from RNA-seq data}.
+\newblock {\em Bioinformatics}, 2010.
+
+\bibitem{Winzeler:1999wa}
+E.~A. Winzeler, D.~D. Shoemaker, A.~Astromoff, H.~Liang, K.~Anderson, B.~Andre,
+  R.~Bangham, R.~Benito, J.~D. Boeke, H.~Bussey, A.~M. Chu, C.~Connelly,
+  K.~Davis, F.~Dietrich, S.~W. Dow, M.~El~Bakkoury, F.~Foury, S.~H. Friend,
+  E.~Gentalen, G.~Giaever, J.~H. Hegemann, T.~Jones, M.~Laub, H.~Liao,
+  N.~Liebundguth, D.~J. Lockhart, A.~Lucau-Danila, M.~Lussier, N.~M'Rabet,
+  P.~Menard, M.~Mittmann, C.~Pai, C.~Rebischung, J.~L. Revuelta, L.~Riles,
+  C.~J. Roberts, P.~Ross-MacDonald, B.~Scherens, M.~Snyder, S.~Sookhai-Mahadeo,
+  R.~K. Storms, S.~V{\'e}ronneau, M.~Voet, G.~Volckaert, T.~R. Ward,
+  R.~Wysocki, G.~S. Yen, K.~Yu, K.~Zimmermann, P.~Philippsen, M.~Johnston, and
+  R.~W. Davis.
+\newblock {Functional characterization of the S. cerevisiae genome by gene
+  deletion and parallel analysis.}
+\newblock {\em Science}, 285(5429):901--906, Aug. 1999.
+
+\end{thebibliography}
+
+\end{document}
+
+

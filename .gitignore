@@ -1,0 +1,9 @@
+.Rproj.user
+.Rhistory
+.RData
+*.Rproj
+*.tex
+*.synctex.gz
+cache_knitr
+texput.log
+*.log

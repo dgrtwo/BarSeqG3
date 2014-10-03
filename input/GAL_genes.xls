@@ -1,0 +1,15 @@
+Gene	Description	Systematic	Repressor
+Gal1p	Galactokinase. Can also substitute for Gal3p	YBR020W	no
+Gal2p	Galactose permease	YLR081W	no
+Gal3p	Ligand sensor in the GAL genetic switch. No kinase activity	YDR009W	no
+Gal4p	Transcription factor (activator) in the GAL genetic switch	YPL248C	no
+Lap3p	Aminopeptidase; Bleomycin hydrolase	YNL239W	no
+Gal7p	Galactose 1-phosphate uridyltransferase	YBR018C	no
+Gal10p	Galactose mutarotase and UDP-galactose 4- epimerase	YBR019C	no
+Pgm1p	Phosphoglucomutase (minor isoform)	YKL127W	no
+Pgm2p	Phosphoglucomutase (major isoform)	YMR105C	no
+Cyc8p	Transcriptional co-repressor; acts in complex with Tup1p	YBR112C	no
+Tup1p	General transcriptional repressor; acts with Cyc8p	YCR084C	no
+Snf1p	Protein kinase, phosphorylates Mig1p	YDR477W	no
+Gal80p	Transcription factor (repressor) in the GAL genetic switch	YML051W	yes
+Mig1p	Transcription factor which represses numerous systems including the GAL genes in the presence of glucose	YGL035C	yes
